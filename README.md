@@ -1,0 +1,1 @@
+Try to learn diffusion LM by training a toy model
