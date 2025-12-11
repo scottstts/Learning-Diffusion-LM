@@ -11,3 +11,4 @@
 
 ckpt/*
 encoded_data.pt
+__pycache__/
