@@ -8,3 +8,6 @@
 *.njsproj
 *.sln
 *.sw?
+
+ckpt/*
+encoded_data.pt
