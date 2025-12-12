@@ -422,7 +422,7 @@ class MDLMVisualizer:
             seq_len=self.seq_len,
             mask_token=self.mask_token,
             num_steps=100,
-            temperature=0.7,
+            temperature=1.0,
             device=self.device
         )
 
@@ -659,7 +659,7 @@ def main():
     block_size = 512
     n_embd = 512
     n_head = 4
-    n_blocks = 4
+    n_blocks = 6
 
     # Load model
     CKPT_PATH = './ckpt/latest.pt'
