@@ -431,71 +431,150 @@ class MDLMVisualizer:
         self.prev_tokens = None
         self.playing = True
 
-    def get_token_display(self, token_id):
-        """Get displayable string for a BPE token."""
+    def get_token_str(self, token_id):
+        """Get the raw token string."""
         if token_id == self.mask_token:
-            return '?'  # Question mark for mask
-        token_str = self.tokenizer.vocab.get(token_id, '?')
-        # Handle special characters for display - use ASCII-safe replacements
+            return '<MASK>'
+        return self.tokenizer.vocab.get(token_id, '?')
+
+    def get_token_display(self, token_str):
+        """Convert token string to displayable text."""
+        if token_str == '<MASK>':
+            return '?'
+        # Character replacements for display
+        replacements = {
+            '\n': ' ',  # Newline as space
+            '\t': ' ',  # Tab as space
+            '"': '"',   # Smart quotes to regular
+            '"': '"',
+            ''': "'",
+            ''': "'",
+            '—': '-',   # Em-dash to hyphen
+            '–': '-',   # En-dash to hyphen
+            '…': '...',  # Ellipsis
+        }
         display = ""
         for char in token_str:
-            if char == '\n':
-                display += '_'  # Newline shown as underscore
-            elif char == '\t':
-                display += ' '  # Tab as space
-            elif char == ' ':
-                display += ' '  # Keep space
-            elif ord(char) < 32 or ord(char) > 126:
-                # Non-printable or non-ASCII - skip or use placeholder
-                display += '.'
+            if char in replacements:
+                display += replacements[char]
+            elif ord(char) < 32:
+                # Control characters - show as space
+                display += ' '
+            elif ord(char) > 126:
+                # Extended ASCII/Unicode - try to show, fallback to ?
+                display += char  # Let pygame try to render it
             else:
                 display += char
         return display if display else '?'
 
-    def get_token_width(self, token_id):
-        """Calculate pixel width for a token based on its string length."""
-        display = self.get_token_display(token_id)
-        # Minimum width of 2 chars, add padding
-        char_count = max(2, len(display))
-        return char_count * self.char_width + 12  # 12px padding
+    def is_space_token(self, token_id):
+        """Check if a token is purely whitespace."""
+        if token_id == self.mask_token:
+            return False
+        token_str = self.tokenizer.vocab.get(token_id, '')
+        return token_str.strip() == '' and len(token_str) > 0
+
+    def merge_tokens_into_words(self, tokens):
+        """
+        Merge adjacent tokens into word groups.
+        Space tokens act as separators.
+        Returns list of groups, where each group is a list of token indices.
+        """
+        groups = []
+        current_group = []
+
+        for i, token_id in enumerate(tokens):
+            if token_id == self.mask_token:
+                # Masks stay individual
+                if current_group:
+                    groups.append(current_group)
+                    current_group = []
+                groups.append([i])
+            elif self.is_space_token(token_id):
+                # Space token - end current group, add space as its own group
+                if current_group:
+                    groups.append(current_group)
+                    current_group = []
+                groups.append([i])
+            else:
+                # Regular token - check if it starts with space
+                token_str = self.tokenizer.vocab.get(token_id, '')
+                if token_str.startswith(' ') or token_str.startswith('\n'):
+                    # Token starts with space - it's a new word
+                    if current_group:
+                        groups.append(current_group)
+                    current_group = [i]
+                else:
+                    # Continue current word
+                    current_group.append(i)
+
+        if current_group:
+            groups.append(current_group)
+
+        return groups
+
+    def get_group_display(self, tokens, group):
+        """Get display string for a group of tokens."""
+        display = ""
+        for idx in group:
+            token_str = self.get_token_str(tokens[idx])
+            display += self.get_token_display(token_str)
+        return display
+
+    def get_group_width(self, display_str):
+        """Calculate pixel width for a display string."""
+        char_count = max(2, len(display_str))
+        return char_count * self.char_width + 12
 
     def draw_mask_cell(self, x, y, width, height):
         """Draw a stylized mask cell with animated-looking pattern."""
-        # Draw background
         pygame.draw.rect(self.screen, self.MASK_BG_COLOR,
-                        (x, y, width - 1, height - 1), border_radius=2)
+                        (x, y, width - 1, height - 1), border_radius=3)
 
-        # Draw a subtle inner glow/border
         inner_margin = 2
         pygame.draw.rect(self.screen, (55, 45, 70),
                         (x + inner_margin, y + inner_margin,
                          width - 1 - 2*inner_margin, height - 1 - 2*inner_margin),
-                        width=1, border_radius=1)
+                        width=1, border_radius=2)
 
-        # Draw question mark
         char_surf = self.cell_font.render('?', True, self.MASK_COLOR)
         char_rect = char_surf.get_rect(center=(x + width//2, y + height//2))
         self.screen.blit(char_surf, char_rect)
 
     def compute_layout(self, tokens):
         """
-        Compute the layout of tokens with dynamic widths and word-wrap.
-        Returns list of (token_id, x, y, width, height) tuples.
+        Compute layout with word-merged cells.
+        Returns list of (group_indices, display_str, x, y, width, height, has_mask) tuples.
         """
+        groups = self.merge_tokens_into_words(tokens)
         layout = []
         x = self.margin
         y = self.header_height + self.margin
         row_height = self.cell_height
 
-        for token_id in tokens:
-            width = self.get_token_width(token_id)
+        for group in groups:
+            # Check if group contains any masks
+            has_mask = any(tokens[idx] == self.mask_token for idx in group)
+
+            if has_mask and len(group) == 1:
+                # Single mask token
+                display_str = '?'
+                width = self.get_group_width(display_str)
+            else:
+                display_str = self.get_group_display(tokens, group)
+                width = self.get_group_width(display_str)
+
+            # Check if this is a space-only token - make it narrower
+            is_space_only = len(group) == 1 and self.is_space_token(tokens[group[0]])
+            if is_space_only:
+                width = width // 2  # Half width for space tokens
 
             # Check if we need to wrap to next line
             if x + width > self.width - self.margin:
                 x = self.margin
                 y += row_height + self.gap
 
-            layout.append((token_id, x, y, width, row_height))
+            layout.append((group, display_str, x, y, width, row_height, has_mask))
             x += width + self.gap
 
         return layout
@@ -540,18 +619,21 @@ class MDLMVisualizer:
         # Compute layout and draw tokens
         layout = self.compute_layout(tokens)
 
-        for i, (token_id, x, y, width, height) in enumerate(layout):
-            # Determine cell style
-            is_mask = (token_id == self.mask_token)
-            was_just_unmasked = (self.prev_tokens is not None and
-                                 self.prev_tokens[i] == self.mask_token and
-                                 not is_mask)
+        for group, display_str, x, y, width, height, has_mask in layout:
 
-            if is_mask:
-                # Use special mask cell drawing
+            # Check if any token in this group was just unmasked
+            was_just_unmasked = False
+            if self.prev_tokens is not None:
+                for idx in group:
+                    if self.prev_tokens[idx] == self.mask_token and tokens[idx] != self.mask_token:
+                        was_just_unmasked = True
+                        break
+
+            if has_mask and len(group) == 1:
+                # Single mask token
                 self.draw_mask_cell(x, y, width, height)
             else:
-                # Normal cell
+                # Normal cell (word group)
                 if was_just_unmasked:
                     bg_color = self.NEWLY_UNMASKED_BG
                     text_color = self.NEWLY_UNMASKED_COLOR
@@ -561,11 +643,10 @@ class MDLMVisualizer:
 
                 pygame.draw.rect(self.screen, bg_color,
                                (x, y, width - 1, height - 1),
-                               border_radius=2)
+                               border_radius=3)
 
-                # Draw token text
-                display_text = self.get_token_display(token_id)
-                text_surf = self.cell_font.render(display_text, True, text_color)
+                # Draw text
+                text_surf = self.cell_font.render(display_str, True, text_color)
                 text_rect = text_surf.get_rect(center=(x + width//2, y + height//2))
                 self.screen.blit(text_surf, text_rect)
 
