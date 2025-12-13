@@ -158,7 +158,7 @@ if __name__ == "__main__":
     TEXT_PATH = 'harry_potter.txt'
     TOKENIZER_PATH = 'tokenizer_bpe.json'
     TENSOR_PATH = 'encoded_data.pt'
-    VOCAB_SIZE = 1000
+    VOCAB_SIZE = 8191
     
     # Load text
     print(f"Loading text from {TEXT_PATH}...")

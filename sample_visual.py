@@ -172,7 +172,7 @@ class MDLM(nn.Module):
 # ============================================================================
 
 @torch.no_grad()
-def sample_with_history(model, seq_len, mask_token, num_steps, temperature, device):
+def sample_with_history(model, seq_len, mask_token, num_steps, temperature, top_p, device):
     """
     Generate text using the reverse diffusion process with ancestral sampling,
     recording all intermediate states.
@@ -197,6 +197,28 @@ def sample_with_history(model, seq_len, mask_token, num_steps, temperature, devi
         # Get model predictions
         t_batch = torch.tensor([t_current], device=device)
         logits = model(x, t_batch)
+
+        if top_p < 1.0:
+            # Sort logits in descending order
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            
+            # Calculate cumulative probabilities
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            # Remove tokens with cumulative probability above top_p
+            sorted_indices_to_remove = cumulative_probs > top_p
+            
+            # handle edge case where top_p is too small
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            
+            # 4. Scatter mask back to original indices
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+            )
+            
+            # 5. Set filtered logits to -inf
+            logits[indices_to_remove] = float('-inf')
 
         # Don't predict [MASK] token during sampling
         logits[:, :, mask_token] = float('-inf')
@@ -264,6 +286,9 @@ class MDLMVisualizer:
     BUTTON_TEXT_COLOR = (240, 240, 245)
     PROGRESS_BAR_BG = (30, 32, 40)
     PROGRESS_BAR_FG = (100, 180, 220)
+    SLIDER_BG = (40, 45, 55)
+    SLIDER_FG = (100, 180, 220)
+    SLIDER_KNOB = (150, 200, 240)
 
     def __init__(self, model, tokenizer, mask_token, seq_len, device,
                  char_width=14, cell_height=32, fps=10, target_width=1400):
@@ -299,23 +324,27 @@ class MDLMVisualizer:
         self.playing = False
         self.prev_tokens = None
 
+        # Temperature slider state
+        self.temperature = 1.0
+        self.temp_min = 0.0
+        self.temp_max = 1.0
+        self.temp_step = 0.1
+        self.slider_dragging = False
+
         # Layout
         self.margin = 30
         self.header_height = 80
         self.width = target_width
 
-        # Calculate height based on average token width from vocabulary
-        # Use average of all token lengths to estimate, with some padding for safety
-        token_lengths = [len(tokenizer.vocab.get(i, '?')) for i in range(len(tokenizer.vocab))]
-        avg_token_len = sum(token_lengths) / len(token_lengths) if token_lengths else 3
-        avg_token_width = max(2, avg_token_len) * self.char_width + 12
+        # Slider layout
+        self.slider_height = 50  # Height reserved for slider area at bottom
 
-        tokens_per_row = (self.width - 2 * self.margin) // (avg_token_width + self.gap)
-        tokens_per_row = max(1, tokens_per_row)
+        # Calculate height based on estimated tokens per row
+        # Use a conservative estimate of ~40 chars per token cell on average
+        avg_cell_width = 50  # Reasonable average cell width in pixels
+        tokens_per_row = max(1, (self.width - 2 * self.margin) // (avg_cell_width + self.gap))
         estimated_rows = (self.seq_len + tokens_per_row - 1) // tokens_per_row
-        # Add 5% more rows as buffer for variable-width tokens
-        estimated_rows = int(estimated_rows * 1.05)
-        self.height = self.header_height + self.margin * 2 + estimated_rows * (cell_height + self.gap) + 60
+        self.height = self.header_height + self.margin * 2 + estimated_rows * (cell_height + self.gap) + 40 + self.slider_height
 
         pygame.init()
         self.screen = pygame.display.set_mode((self.width, self.height))
@@ -356,6 +385,75 @@ class MDLMVisualizer:
         return (self.new_batch_btn_x <= mx <= self.new_batch_btn_x + self.new_batch_btn_width and
                 self.new_batch_btn_y <= my <= self.new_batch_btn_y + self.new_batch_btn_height)
 
+    def get_slider_rect(self):
+        """Get the slider track rectangle."""
+        slider_width = 300
+        slider_x = self.width // 2 - slider_width // 2
+        slider_y = self.height - self.slider_height + 15
+        return (slider_x, slider_y, slider_width, 8)
+
+    def get_slider_knob_pos(self):
+        """Get the x position of the slider knob based on current temperature."""
+        slider_x, slider_y, slider_width, slider_h = self.get_slider_rect()
+        ratio = (self.temperature - self.temp_min) / (self.temp_max - self.temp_min)
+        return slider_x + int(ratio * slider_width)
+
+    def is_slider_hovered(self, mouse_pos):
+        """Check if mouse is over the slider area."""
+        mx, my = mouse_pos
+        slider_x, slider_y, slider_width, slider_h = self.get_slider_rect()
+        knob_x = self.get_slider_knob_pos()
+        knob_radius = 10
+        # Check if hovering over knob or track
+        in_track = (slider_x <= mx <= slider_x + slider_width and
+                    slider_y - 5 <= my <= slider_y + slider_h + 5)
+        in_knob = ((mx - knob_x) ** 2 + (my - (slider_y + slider_h // 2)) ** 2) <= (knob_radius + 3) ** 2
+        return in_track or in_knob
+
+    def update_temp_from_mouse(self, mouse_x):
+        """Update temperature based on mouse x position."""
+        slider_x, _, slider_width, _ = self.get_slider_rect()
+        ratio = (mouse_x - slider_x) / slider_width
+        ratio = max(0, min(1, ratio))
+        raw_temp = self.temp_min + ratio * (self.temp_max - self.temp_min)
+        # Snap to nearest step
+        self.temperature = round(raw_temp / self.temp_step) * self.temp_step
+        self.temperature = max(self.temp_min, min(self.temp_max, self.temperature))
+
+    def draw_slider(self):
+        """Draw the temperature slider at the bottom of the screen."""
+        slider_x, slider_y, slider_width, slider_h = self.get_slider_rect()
+
+        # Draw label
+        label = self.header_font.render(f"Temperature: {self.temperature:.1f}", True, self.TEXT_COLOR)
+        label_rect = label.get_rect(center=(self.width // 2, slider_y - 15))
+        self.screen.blit(label, label_rect)
+
+        # Draw track background
+        pygame.draw.rect(self.screen, self.SLIDER_BG,
+                        (slider_x, slider_y, slider_width, slider_h),
+                        border_radius=4)
+
+        # Draw filled portion
+        knob_x = self.get_slider_knob_pos()
+        fill_width = knob_x - slider_x
+        if fill_width > 0:
+            pygame.draw.rect(self.screen, self.SLIDER_FG,
+                            (slider_x, slider_y, fill_width, slider_h),
+                            border_radius=4)
+
+        # Draw knob
+        knob_y = slider_y + slider_h // 2
+        knob_radius = 10
+        pygame.draw.circle(self.screen, self.SLIDER_KNOB, (knob_x, knob_y), knob_radius)
+        pygame.draw.circle(self.screen, (200, 220, 240), (knob_x, knob_y), knob_radius, width=2)
+
+        # Draw min/max labels
+        min_label = self.cell_font.render(f"{self.temp_min:.1f}", True, (100, 105, 120))
+        max_label = self.cell_font.render(f"{self.temp_max:.1f}", True, (100, 105, 120))
+        self.screen.blit(min_label, (slider_x - 35, slider_y - 3))
+        self.screen.blit(max_label, (slider_x + slider_width + 10, slider_y - 3))
+
     def draw_button(self, x, y, w, h, text, hovered, font=None):
         """Draw a styled button with hover effect."""
         if font is None:
@@ -395,6 +493,9 @@ class MDLMVisualizer:
                         self.button_width, self.button_height,
                         "Generate", hovered)
 
+        # Draw temperature slider
+        self.draw_slider()
+
         pygame.display.flip()
 
     def draw_loading_screen(self):
@@ -422,7 +523,8 @@ class MDLMVisualizer:
             seq_len=self.seq_len,
             mask_token=self.mask_token,
             num_steps=100,
-            temperature=1.0,
+            temperature=self.temperature,
+            top_p=0.9,
             device=self.device
         )
 
@@ -609,12 +711,13 @@ class MDLMVisualizer:
         step_surf = self.header_font.render(step_text, True, (100, 105, 120))
         self.screen.blit(step_surf, (bar_x + bar_width + 20, stats_y))
 
-        # Show "New Batch" button when complete
+        # Show "New Batch" button and slider when complete
         if is_complete:
             hovered = self.is_new_batch_hovered(mouse_pos)
             self.draw_button(self.new_batch_btn_x, self.new_batch_btn_y,
                            self.new_batch_btn_width, self.new_batch_btn_height,
                            "New Batch", hovered, self.header_font)
+            self.draw_slider()
 
         # Compute layout and draw tokens
         layout = self.compute_layout(tokens)
@@ -686,13 +789,28 @@ class MDLMVisualizer:
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:
                         if self.state == "idle":
-                            if self.is_button_hovered(mouse_pos):
+                            if self.is_slider_hovered(mouse_pos):
+                                self.slider_dragging = True
+                                self.update_temp_from_mouse(mouse_pos[0])
+                            elif self.is_button_hovered(mouse_pos):
                                 self.run_inference()
                         elif self.state == "playing" and self.history:
-                            # Check if "New Batch" button clicked (only visible when complete)
+                            # Check if "New Batch" button or slider clicked (only visible when complete)
                             is_complete = (self.current_frame == len(self.history) - 1)
-                            if is_complete and self.is_new_batch_hovered(mouse_pos):
-                                self.run_inference()
+                            if is_complete:
+                                if self.is_slider_hovered(mouse_pos):
+                                    self.slider_dragging = True
+                                    self.update_temp_from_mouse(mouse_pos[0])
+                                elif self.is_new_batch_hovered(mouse_pos):
+                                    self.run_inference()
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        self.slider_dragging = False
+                elif event.type == pygame.MOUSEMOTION:
+                    if self.slider_dragging:
+                        is_complete = self.state == "idle" or (self.state == "playing" and self.history and self.current_frame == len(self.history) - 1)
+                        if is_complete:
+                            self.update_temp_from_mouse(mouse_pos[0])
 
             # Draw based on state
             if self.state == "idle":
@@ -756,7 +874,18 @@ def main():
     if os.path.exists(CKPT_PATH):
         print(f"Loading model weights from {CKPT_PATH}...")
         checkpoint = torch.load(CKPT_PATH, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
+
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('_orig_mod.'):
+                # Remove the prefix
+                new_key = key[10:]  # len('_orig_mod.') == 10
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        
+        model.load_state_dict(new_state_dict)
         print(f"Model loaded successfully (from Epoch {checkpoint['epoch']+1})")
     else:
         print(f"Warning: No checkpoint found at {CKPT_PATH}. Using random initialization.")
