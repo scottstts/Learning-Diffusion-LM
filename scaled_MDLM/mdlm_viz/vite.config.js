@@ -1,7 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { spawn } from 'child_process'
-import path from 'path'
 
 // Custom middleware to bridge to Python
 const pythonInference = () => {

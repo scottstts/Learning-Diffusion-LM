@@ -16,13 +16,17 @@ export default function MDLMVisualizer() {
     const [isPlaying, setIsPlaying] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
     const [temperature, setTemperature] = useState(1.0);
-    const [stepCountConfig, setStepCountConfig] = useState(50);
+    const [stepCountConfig] = useState(50);
     const [error, setError] = useState(null);
 
     const animationFrameRef = useRef();
     const lastFrameTimeRef = useRef(0);
     const FPS = 10; // Frames per second
     const frameInterval = 1000 / FPS;
+
+    const normalizeTokenString = (raw) => {
+        return (raw || '').replace(/Ġ/g, ' ').replace(/\r?\n/g, '');
+    };
 
     // Handle Animation Loop
     useEffect(() => {
@@ -44,7 +48,7 @@ export default function MDLMVisualizer() {
             animationFrameRef.current = requestAnimationFrame(animate);
         }
         return () => cancelAnimationFrame(animationFrameRef.current);
-    }, [isPlaying, history, currentStep]);
+    }, [isPlaying, history, currentStep, frameInterval]);
 
     const handleGenerate = async () => {
         setIsLoading(true);
@@ -87,49 +91,127 @@ export default function MDLMVisualizer() {
         if (tokenId === maskTokenId) return '?';
         const raw = vocab[tokenId] || '';
         // Basic cleanup similar to python
-        return raw.replace(/Ġ/g, ' ').replace(/\n/g, '↵');
+        return normalizeTokenString(raw);
     };
 
     // Helper to merge tokens into word groups for display
-    const getDisplayGroups = (tokens, prevTokens) => {
+    const getDisplayGroups = (tokens) => {
         if (!tokens) return [];
 
         const groups = [];
         let currentGroup = [];
 
-        tokens.forEach((id, idx) => {
-            let tokenStr = vocab[id] || '';
+        tokens.forEach((id) => {
+            const rawToken = vocab[id] || '';
             const isMask = id === maskTokenId;
-            const isEndOfText = tokenStr === '<|endoftext|>';
+            const isEndOfText = rawToken === '<|endoftext|>';
+            const newlineCount = (rawToken.match(/\r?\n/g) || []).length;
+
+            // Always isolate special tokens.
+            if (isEndOfText) {
+                if (currentGroup.length > 0) {
+                    groups.push(currentGroup);
+                    currentGroup = [];
+                }
+
+                groups.push([
+                    {
+                        id,
+                        text: '',
+                        isMask: false,
+                        isEndOfText: true
+                    }
+                ]);
+                return;
+            }
+
+            // Mask tokens should never merge with anything; render as standalone '?' cells.
+            if (isMask) {
+                if (currentGroup.length > 0) {
+                    groups.push(currentGroup);
+                    currentGroup = [];
+                }
+
+                groups.push([
+                    {
+                        id,
+                        text: '?',
+                        isMask: true,
+                        isEndOfText: false,
+                        isBreak: false
+                    }
+                ]);
+                return;
+            }
+
+            // Newlines should not be displayed as '↵'; treat them as hard line breaks.
+            if (newlineCount > 0) {
+                if (currentGroup.length > 0) {
+                    groups.push(currentGroup);
+                    currentGroup = [];
+                }
+
+                for (let i = 0; i < newlineCount; i++) {
+                    groups.push([
+                        {
+                            id,
+                            text: '',
+                            isMask: false,
+                            isEndOfText: false,
+                            isBreak: true
+                        }
+                    ]);
+                }
+
+                const remainderRaw = rawToken.replace(/\r?\n/g, '');
+                const remainderText = normalizeTokenString(remainderRaw);
+                if (remainderText.trim() !== '') {
+                    currentGroup.push({
+                        id,
+                        text: remainderText,
+                        isMask: false,
+                        isEndOfText: false,
+                        isBreak: false
+                    });
+                }
+
+                return;
+            }
 
             // Logic to start a new word group
             // 1. Explicit space prefix
             // 2. Starts with specific punctuation like "
             // 3. Is <|endoftext|> (always isolate)
-            const isNewWord = tokenStr.startsWith(' ') ||
-                tokenStr.startsWith('Ġ') ||
-                tokenStr.startsWith('"') ||
-                tokenStr.startsWith('“') ||
-                isEndOfText;
+            const isNewWord = rawToken.startsWith(' ') ||
+                rawToken.startsWith('Ġ') ||
+                rawToken.startsWith('"') ||
+                rawToken.startsWith('“');
 
-            if ((isNewWord || isEndOfText) && currentGroup.length > 0) {
+            if (isNewWord && currentGroup.length > 0) {
                 groups.push(currentGroup);
                 currentGroup = [];
+            }
+
+            const tokenDisplay = getTokenDisplay(id);
+
+            // Skip whitespace-only tokens entirely (these typically represent standalone space markers
+            // and render as ultra-thin "stripes" in the grid).
+            if (tokenDisplay.trim() === '') {
+                if (currentGroup.length > 0) {
+                    groups.push(currentGroup);
+                    currentGroup = [];
+                }
+                return;
             }
 
             currentGroup.push({
                 id,
-                text: isEndOfText ? '' : tokenStr.replace(/Ġ/g, ' '), // Replace special chars, empty for endoftext
+                text: tokenDisplay, // Already normalized via getTokenDisplay
                 isMask,
                 // Removed wasJustUnmasked logic as requested
-                isEndOfText
+                isEndOfText,
+                isBreak: false
             });
-
-            // If it was end of text, push immediate group so it isolates
-            if (isEndOfText) {
-                groups.push(currentGroup);
-                currentGroup = [];
-            }
         });
         if (currentGroup.length > 0) groups.push(currentGroup);
 
@@ -137,14 +219,13 @@ export default function MDLMVisualizer() {
     };
 
     const currentTokens = history ? history[currentStep] : [];
-    const prevTokens = history && currentStep > 0 ? history[currentStep - 1] : null;
-    const groups = getDisplayGroups(currentTokens, prevTokens);
+    const groups = getDisplayGroups(currentTokens);
 
     return (
         <div style={{
             display: 'flex',
             flexDirection: 'column',
-            height: '100vh',
+            height: '100%',
             backgroundColor: '#1a1b26',
             color: '#a9b1d6',
             overflow: 'hidden'
@@ -208,8 +289,10 @@ export default function MDLMVisualizer() {
             {/* Main Content Area */}
             <div style={{
                 flex: 1,
+                minHeight: 0,
                 overflowY: 'auto',
                 padding: '30px',
+                paddingBottom: '100px',
                 display: 'flex',
                 flexWrap: 'wrap',
                 alignContent: 'flex-start',
@@ -234,57 +317,54 @@ export default function MDLMVisualizer() {
                 )}
 
                 {groups.map((group, gIdx) => {
-                    const isBreakGroup = group.length === 1 && group[0].isEndOfText;
+                    const isBreakGroup = group.length === 1 && (group[0].isEndOfText || group[0].isBreak);
+                    if (isBreakGroup) {
+                        return (
+                            <div
+                                key={gIdx}
+                                style={{ flexBasis: '100%', width: '100%', height: '20px' }}
+                            />
+                        );
+                    }
+
+                    const mergedTextRaw = group.map((t) => (t.isMask ? '?' : t.text)).join('');
+                    const mergedText = mergedTextRaw.replace(/^\s+/, '');
+                    if (mergedText.length === 0) return null;
+
+                    // Style logic (word-level)
+                    let bg = CELL_BG_COLOR;
+                    let color = TEXT_COLOR;
+                    let border = '1px solid transparent';
+
+                    // Mask groups are always single-token groups by construction.
+                    const isMaskGroup = group.length === 1 && group[0].isMask;
+                    if (isMaskGroup) {
+                        bg = '#2a2635'; // MASK BG
+                        color = MASK_COLOR;
+                        border = '1px solid #45354a';
+                    }
 
                     return (
-                        <div key={gIdx} style={{
-                            display: 'flex',
-                            flexWrap: 'wrap',
-                            backgroundColor: isBreakGroup ? 'transparent' : 'rgba(0,0,0,0.2)',
-                            borderRadius: '4px',
-                            padding: isBreakGroup ? '0' : '2px',
-                            marginRight: '2px', // Reduced gap further
-                            marginBottom: '2px',
-                            maxWidth: '100%',
-                            width: isBreakGroup ? '100%' : 'auto', // Full width for breaks
-                            height: isBreakGroup ? '20px' : 'auto'
-                        }}>
-                            {group.map((token, tIdx) => {
-                                // Style logic - Green removed
-                                let bg = CELL_BG_COLOR;
-                                let color = TEXT_COLOR;
-                                let border = '1px solid transparent';
-
-                                if (token.isMask) {
-                                    bg = '#2a2635'; // MASK BG
-                                    color = MASK_COLOR;
-                                    border = '1px solid #45354a';
-                                } else if (token.isEndOfText) {
-                                    // Special style for the break token text itself if visible
-                                    bg = 'transparent';
-                                    color = '#565f89';
-                                }
-
-                                return (
-                                    <div key={tIdx} style={{
-                                        padding: '2px 1px',
-                                        minWidth: token.isMask ? '14px' : 'auto',
-                                        textAlign: 'center',
-                                        display: 'flex',
-                                        justifyContent: 'center', // Center text
-                                        backgroundColor: bg,
-                                        color: color,
-                                        fontFamily: 'monospace',
-                                        fontSize: '14px',
-                                        border: border,
-                                        borderRadius: '2px',
-                                        transition: 'background-color 0.2s',
-                                        whiteSpace: 'pre-wrap'
-                                    }}>
-                                        {token.isMask ? '?' : token.text}
-                                    </div>
-                                );
-                            })}
+                        <div
+                            key={gIdx}
+                            style={{
+                                padding: '2px 6px',
+                                minWidth: isMaskGroup ? '14px' : 'auto',
+                                textAlign: 'center',
+                                display: 'flex',
+                                justifyContent: 'center',
+                                alignItems: 'center',
+                                backgroundColor: bg,
+                                color: color,
+                                fontFamily: 'monospace',
+                                fontSize: '14px',
+                                border: border,
+                                borderRadius: '4px',
+                                transition: 'background-color 0.2s',
+                                whiteSpace: 'pre'
+                            }}
+                        >
+                            {mergedText}
                         </div>
                     );
                 })}
