@@ -14,8 +14,9 @@ export default function MDLMVisualizer() {
     const [maskTokenId, setMaskTokenId] = useState(null);
     const [currentStep, setCurrentStep] = useState(0);
     const [isPlaying, setIsPlaying] = useState(false);
+    const [hasPlaybackFinished, setHasPlaybackFinished] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
-    const [temperature, setTemperature] = useState(1.0);
+    const [temperature, setTemperature] = useState(0.7);
     const [stepCountConfig] = useState(50);
     const [error, setError] = useState(null);
 
@@ -37,6 +38,7 @@ export default function MDLMVisualizer() {
                         const next = prev + 1;
                         if (next >= history.length - 1) {
                             setIsPlaying(false); // Stop at end
+                            setHasPlaybackFinished(true);
                             return history.length - 1;
                         }
                         return next;
@@ -56,6 +58,7 @@ export default function MDLMVisualizer() {
         setHistory(null);
         setCurrentStep(0);
         setIsPlaying(false);
+        setHasPlaybackFinished(false);
 
         try {
             const response = await fetch('/api/generate', {
@@ -78,7 +81,11 @@ export default function MDLMVisualizer() {
             setMaskTokenId(data.mask_token);
 
             // Auto-play after loading
-            setIsPlaying(true);
+            if (data.history && data.history.length > 1) {
+                setIsPlaying(true);
+            } else {
+                setHasPlaybackFinished(true);
+            }
         } catch (err) {
             console.error(err);
             setError(err.message);
@@ -220,6 +227,9 @@ export default function MDLMVisualizer() {
 
     const currentTokens = history ? history[currentStep] : [];
     const groups = getDisplayGroups(currentTokens);
+    const lastStep = history ? Math.max(0, history.length - 1) : 0;
+    const showPlaybackControls = Boolean(history) && !hasPlaybackFinished;
+    const showTimeScrubber = Boolean(history) && hasPlaybackFinished;
 
     return (
         <div style={{
@@ -259,17 +269,45 @@ export default function MDLMVisualizer() {
                             step="0.1"
                             value={temperature}
                             onChange={(e) => setTemperature(parseFloat(e.target.value))}
-                            disabled={isLoading || isPlaying}
+                            disabled={isLoading || (Boolean(history) && !hasPlaybackFinished)}
                         />
                     </div>
 
-                    <button
-                        onClick={isPlaying ? () => setIsPlaying(false) : () => setIsPlaying(true)}
-                        disabled={!history || isLoading}
-                        style={{ minWidth: '80px' }}
-                    >
-                        {isPlaying ? 'Pause' : 'Play'}
-                    </button>
+                    {showPlaybackControls && (
+                        <button
+                            onClick={isPlaying ? () => setIsPlaying(false) : () => setIsPlaying(true)}
+                            disabled={isLoading}
+                            style={{
+                                width: '90px',
+                                display: 'inline-flex',
+                                justifyContent: 'center',
+                                alignItems: 'center',
+                                whiteSpace: 'nowrap'
+                            }}
+                        >
+                            {isPlaying ? 'Pause' : 'Play'}
+                        </button>
+                    )}
+
+                    {showTimeScrubber && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '5px', minWidth: '260px' }}>
+                            <label style={{ fontSize: '0.8rem' }}>
+                                Time: {currentStep} / {lastStep}
+                            </label>
+                            <input
+                                type="range"
+                                min="0"
+                                max={lastStep}
+                                step="1"
+                                value={currentStep}
+                                onChange={(e) => {
+                                    setIsPlaying(false);
+                                    setCurrentStep(parseInt(e.target.value, 10));
+                                }}
+                                disabled={isLoading || !history}
+                            />
+                        </div>
+                    )}
 
                     <button
                         onClick={handleGenerate}
@@ -278,7 +316,12 @@ export default function MDLMVisualizer() {
                             backgroundColor: '#7aa2f7',
                             color: '#1a1b26',
                             fontWeight: 'bold',
-                            opacity: isLoading ? 0.7 : 1
+                            opacity: isLoading ? 0.7 : 1,
+                            width: '160px',
+                            display: 'inline-flex',
+                            justifyContent: 'center',
+                            alignItems: 'center',
+                            whiteSpace: 'nowrap'
                         }}
                     >
                         {isLoading ? 'Running...' : 'New Batch'}

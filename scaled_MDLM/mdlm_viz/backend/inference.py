@@ -12,7 +12,7 @@ class Config:
     # Paths (relative to the script itself, to be robust)
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     TOKENIZER_PATH = os.path.join(BASE_DIR, 'tokenizer_bpe.json')
-    CKPT_PATH = os.path.join(BASE_DIR, 'latest.pt')
+    CKPT_PATH = os.path.join(BASE_DIR, 'model_state_fp32.pt')
     
     BLOCK_SIZE = 1024
     N_EMBD = 768
