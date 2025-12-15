@@ -161,7 +161,7 @@ class MDLM(nn.Module):
 # ============================================================================
 
 @torch.no_grad()
-def sample_with_history(model, seq_len, mask_token, num_steps, temperature, top_p, device):
+def sample_with_history(model, seq_len, mask_token, num_steps, temperature, top_p, device, prompt=None):
     """
     Generate text using the reverse diffusion process with ancestral sampling,
     recording all intermediate states.
@@ -172,9 +172,21 @@ def sample_with_history(model, seq_len, mask_token, num_steps, temperature, top_
     model.eval()
     history = []
 
-    # Start with all masks
-    x = torch.full((1, seq_len), mask_token, dtype=torch.long, device=device)
-    history.append(x[0].tolist())
+    # Validate prompt - must be None or a list of integers without None values
+    if prompt is not None:
+        if not isinstance(prompt, list) or any(p is None for p in prompt):
+            prompt = None  # Fall back to default
+
+    if prompt is None:
+        # Start with all masks
+        x = torch.full((1, seq_len), mask_token, dtype=torch.long, device=device)
+        # Set start and end tokens to be <|endoftext|>
+        x[0][0] = 242
+        x[0][-1] = 242
+        history.append(x[0].tolist())
+    else:
+        x = torch.tensor(prompt, dtype=torch.long, device=device).unsqueeze(0)
+        history.append(x[0].tolist())
 
     # Linearly spaced time steps from 1 to 0
     timesteps = torch.linspace(1, 0, num_steps + 1, device=device)

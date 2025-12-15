@@ -20,7 +20,7 @@ class Config:
     N_BLOCKS = 12
     
     SEQ_LEN = 1024
-    NUM_STEPS = 50 # Default, can be overridden
+    NUM_STEPS = 100 # Default, can be overridden
     TOP_P = 0.9
 
 # ============================================================================
@@ -31,6 +31,8 @@ class SimpleBPE:
         self.vocab = {}
         self.special_tokens = {}
         self.inv_vocab = {}
+        self.merges = []
+        self.merge_ranks = {}
 
     def load(self, path):
         if not os.path.exists(path):
@@ -52,30 +54,101 @@ class SimpleBPE:
                 else:
                     # Assume flat dict
                     raw_vocab = data
-                
+
                 # Convert keys to integers (JSON keys are always strings)
                 self.vocab = {int(k): v for k, v in raw_vocab.items()}
-            
-            # Identify special tokens
-            # We need to find the ID for <MASK> (which is a value in raw_vocab, or usually we look up by string)
-            # Create inverse vocab first for easy lookup
+
+                # Load merges if available
+                if 'merges' in data:
+                    self.merges = data['merges']
+                    # Build merge ranks for BPE encoding
+                    for i, merge in enumerate(self.merges):
+                        self.merge_ranks[tuple(merge)] = i
+
+                # Load special tokens
+                if 'special_tokens' in data:
+                    self.special_tokens = data['special_tokens']
+
+            # Create inverse vocab for easy lookup
             self.inv_vocab = {v: k for k, v in self.vocab.items()}
-            
-            if '<MASK>' in self.inv_vocab:
+
+            # Fallback special token detection if not in file
+            if '<MASK>' not in self.special_tokens and '<MASK>' in self.inv_vocab:
                 self.special_tokens['<MASK>'] = self.inv_vocab['<MASK>']
-            if '<|endoftext|>' in self.inv_vocab:
+            if '<|endoftext|>' not in self.special_tokens and '<|endoftext|>' in self.inv_vocab:
                 self.special_tokens['<|endoftext|>'] = self.inv_vocab['<|endoftext|>']
-                
+
         return self
+
+    def encode(self, text):
+        """Encode text to token IDs using BPE."""
+        if not text:
+            return []
+
+        # Convert text to initial character-level tokens
+        # GPT-2 style: space becomes 'Ġ' character
+        tokens = []
+        for char in text:
+            if char == ' ':
+                tokens.append('Ġ')
+            else:
+                tokens.append(char)
+
+        # Convert to token IDs (character level first)
+        token_ids = []
+        for tok in tokens:
+            if tok in self.inv_vocab:
+                token_ids.append(self.inv_vocab[tok])
+            else:
+                # Unknown character - skip
+                pass
+
+        # Apply BPE merges iteratively
+        while len(token_ids) >= 2:
+            # Find the best merge (lowest rank)
+            best_merge = None
+            best_rank = float('inf')
+
+            for i in range(len(token_ids) - 1):
+                pair = (token_ids[i], token_ids[i + 1])
+                if pair in self.merge_ranks:
+                    rank = self.merge_ranks[pair]
+                    if rank < best_rank:
+                        best_rank = rank
+                        best_merge = pair
+
+            if best_merge is None:
+                break
+
+            # Find the merged token
+            tok1 = self.vocab.get(best_merge[0], '')
+            tok2 = self.vocab.get(best_merge[1], '')
+            merged_str = tok1 + tok2
+
+            if merged_str in self.inv_vocab:
+                merged_id = self.inv_vocab[merged_str]
+                # Apply merge at all occurrences
+                new_token_ids = []
+                i = 0
+                while i < len(token_ids):
+                    if i < len(token_ids) - 1 and (token_ids[i], token_ids[i + 1]) == best_merge:
+                        new_token_ids.append(merged_id)
+                        i += 2
+                    else:
+                        new_token_ids.append(token_ids[i])
+                        i += 1
+                token_ids = new_token_ids
+            else:
+                break
+
+        return token_ids
 def main():
     # 1. Parse Arguments (JSON from stdin or args)
-    # Expected input: { "temperature": 1.0, "steps": 50 }
+    # Expected input: { "mode": "generate"|"tokenize"|"info", "temperature": 1.0, "steps": 50, "prompt": [...], "text": "..." }
     try:
         if len(sys.argv) > 1:
-            # Maybe passed as string arg?
             args = json.loads(sys.argv[1])
         elif not sys.stdin.isatty():
-             # Read from stdin
             input_str = sys.stdin.read()
             if input_str.strip():
                 args = json.loads(input_str)
@@ -87,27 +160,79 @@ def main():
         sys.stderr.write(f"Error parsing input: {e}\n")
         args = {}
 
+    mode = args.get("mode", "generate")
+
+    # Load Tokenizer (needed for all modes)
+    tokenizer = SimpleBPE().load(Config.TOKENIZER_PATH)
+    mask_token = tokenizer.special_tokens.get('<MASK>')
+    endoftext_token = tokenizer.special_tokens.get('<|endoftext|>')
+    if mask_token is None:
+        mask_token = 0
+        sys.stderr.write("Warning: <MASK> token not found in vocab, using 0\n")
+
+    # Handle tokenize mode
+    if mode == "tokenize":
+        text = args.get("text", "")
+
+        # Tokenize word-by-word to track word boundaries
+        words = text.split(' ')
+        all_token_ids = []
+        all_tokens_info = []
+        word_boundaries = [0]  # First word always starts at 0
+
+        for i, word in enumerate(words):
+            if not word:  # Skip empty strings from multiple spaces
+                continue
+
+            # Add space prefix for words after the first
+            word_to_tokenize = word if i == 0 else ' ' + word
+            word_token_ids = tokenizer.encode(word_to_tokenize)
+
+            # Track where this word starts in token sequence
+            if i > 0 and word_token_ids:
+                word_boundaries.append(len(all_token_ids))
+
+            all_token_ids.extend(word_token_ids)
+            for tid in word_token_ids:
+                all_tokens_info.append({
+                    "id": tid,
+                    "text": tokenizer.vocab.get(tid, '?')
+                })
+
+        output = {
+            "tokens": all_tokens_info,
+            "token_ids": all_token_ids,
+            "word_boundaries": word_boundaries
+        }
+        print(json.dumps(output))
+        return
+
+    # Handle info mode (return config info)
+    if mode == "info":
+        output = {
+            "seq_len": Config.SEQ_LEN,
+            "mask_token": mask_token,
+            "endoftext_token": endoftext_token,
+            "vocab_size": len(tokenizer.vocab)
+        }
+        print(json.dumps(output))
+        return
+
+    # Generate mode
     temperature = float(args.get("temperature", 1.0))
     steps = int(args.get("steps", Config.NUM_STEPS))
-    
-    # 2. Setup Device
-    device = torch.device("cpu") # Force CPU for local web server friendliness, or check CUDA
+    prompt = args.get("prompt", None)  # Array of token IDs or None
+
+    # Setup Device
+    device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
-    
-    # 3. Load Tokenizer
-    tokenizer = SimpleBPE().load(Config.TOKENIZER_PATH)
-    mask_token = tokenizer.special_tokens.get('<MASK>')
-    if mask_token is None:
-        # Fallback if not found in vocab
-        mask_token = 0 
-        sys.stderr.write("Warning: <MASK> token not found in vocab, using 0\n")
 
     vocab_size = len(tokenizer.vocab)
 
-    # 4. Load Model
+    # Load Model
     model = MDLM(
         vocab_size=vocab_size,
         n_embd=Config.N_EMBD,
@@ -120,25 +245,22 @@ def main():
         try:
             checkpoint = torch.load(Config.CKPT_PATH, map_location=device, weights_only=False)
             state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-            
-            # Clean state dict keys if needed
+
             new_state_dict = {}
             for key, value in state_dict.items():
                 if key.startswith('_orig_mod.'):
                     new_state_dict[key[10:]] = value
                 else:
                     new_state_dict[key] = value
-            
+
             model.load_state_dict(new_state_dict)
             sys.stderr.write(f"Model loaded from {Config.CKPT_PATH}\n")
         except Exception as e:
             sys.stderr.write(f"Failed to load checkpoint: {e}\n")
-            # Continue with random weights? Or failed.
-            # Ideally fail, but for demo let's continue.
     else:
         sys.stderr.write(f"Warning: Checkpoint not found at {Config.CKPT_PATH}. Using random weights.\n")
 
-    # 5. Run Inference
+    # Run Inference
     history = sample_with_history(
         model,
         seq_len=Config.SEQ_LEN,
@@ -146,25 +268,15 @@ def main():
         num_steps=steps,
         temperature=temperature,
         top_p=Config.TOP_P,
-        device=device
+        device=device,
+        prompt=prompt
     )
 
-    # 6. Output JSON result
-    # We want to send back:
-    # - history: list of [ [token_id, ...], ... ]
-    # - vocab: map of id -> string (so frontend can render)
-    #   Sending full vocab might be heavy. 
-    #   Alternatively, we can just send the string representation of history?
-    #   Or send the used tokens' strings.
-    #   For "visualization", knowing the specific tokens is useful.
-    #   Let's send tokens + a subset of vocab or dynamic lookup?
-    #   The existing pygame visualizer decodes on the fly.
-    #   Let's send valid strings for the tokens used in the history.
-    
+    # Output JSON result
     used_token_ids = set()
     for step in history:
         used_token_ids.update(step)
-    
+
     vocab_subset = {id: tokenizer.vocab.get(id, '?') for id in used_token_ids}
 
     output = {
@@ -172,7 +284,7 @@ def main():
         "vocab": vocab_subset,
         "mask_token": mask_token
     }
-    
+
     print(json.dumps(output))
 
 if __name__ == "__main__":
